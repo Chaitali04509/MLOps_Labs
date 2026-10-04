@@ -1,0 +1,46 @@
+name: Lab1 - Python Unittests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Lab1/**'
+      - '.github/workflows/lab1_unittest.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Lab1/**'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: Lab1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Run unittests
+      run: python -m unittest test.test_unittest -v
+
+    - name: Notify on success
+      if: success()
+      run: echo "Unit tests passed successfully"
+
+    - name: Notify on failure
+      if: failure()
+      run: echo "Unit tests failed"
