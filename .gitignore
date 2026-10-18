@@ -9,3 +9,5 @@ coverage.xml
 pytest-report.xml
 reports/
 .DS_Store
+build/
+mlruns/

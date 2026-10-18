@@ -1,0 +1,207 @@
+name: Lab2 - Model Training Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Lab2/**'
+      - '!Lab2/models/**'     # the pipeline's own commits must not retrigger it
+      - '!Lab2/metrics/**'
+      - '!Lab2/**.md'
+      - '.github/workflows/lab2_model_pipeline.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Lab2/**'
+  workflow_dispatch: # run manually from the Actions tab and pick the model
+    inputs:
+      model_type:
+        description: 'Model to train'
+        type: choice
+        options:
+          - random_forest
+          - gradient_boosting
+          - logistic_regression
+        default: random_forest
+      n_estimators:
+        description: 'Number of trees (ignored by logistic_regression)'
+        type: string
+        default: '100'
+      max_depth:
+        description: 'Max tree depth (0 = default)'
+        type: string
+        default: '0'
+      min_f1:
+        description: 'Quality gate: minimum F1 score to pass'
+        type: string
+        default: '0.90'
+      force_promote:
+        description: 'Promote even if it does not beat the champion'
+        type: boolean
+        default: false
+
+# Read-only by default. Only the promote job is allowed to push.
+permissions:
+  contents: read
+
+# Never run two pipelines at once, or their registry commits would conflict
+concurrency:
+  group: lab2-model-pipeline
+  cancel-in-progress: false
+
+# Push and pull_request events have no inputs, so fall back to defaults
+env:
+  MODEL_TYPE: ${{ inputs.model_type || 'random_forest' }}
+  N_ESTIMATORS: ${{ inputs.n_estimators || '100' }}
+  MAX_DEPTH: ${{ inputs.max_depth || '0' }}
+  MIN_F1: ${{ inputs.min_f1 || '0.90' }}
+  FORCE_PROMOTE: ${{ inputs.force_promote || false }}
+  PYTHON_VERSION: '3.11'
+
+defaults:
+  run:
+    working-directory: Lab2
+
+jobs:
+  test:
+    name: 1. Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: Lab2/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -v
+
+  train:
+    name: 2. Train model
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: Lab2/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create version tag (UTC timestamp + short commit SHA)
+        id: version
+        run: echo "version=$(date -u '+%Y%m%d%H%M%S')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Train
+        run: |
+          python src/train_model.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --model-type "$MODEL_TYPE" \
+            --n-estimators "$N_ESTIMATORS" \
+            --max-depth "$MAX_DEPTH"
+
+      - name: Upload trained model
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: Lab2/build/
+          retention-days: 7
+
+  evaluate:
+    name: 3. Evaluate and quality gate
+    needs: train
+    runs-on: ubuntu-latest
+    outputs:
+      promote: ${{ steps.decide.outputs.promote }}
+    env:
+      VERSION: ${{ needs.train.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: Lab2/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download trained model
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: Lab2/build/
+
+      - name: Evaluate on held-out test set (fails if F1 < MIN_F1)
+        run: python src/evaluate_model.py --version "$VERSION" --min-f1 "$MIN_F1"
+
+      - name: Compare with current champion
+        id: decide
+        run: python src/promote_model.py check --version "$VERSION" --force "$FORCE_PROMOTE"
+
+      - name: Upload evaluated model
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluated-model
+          path: Lab2/build/
+          retention-days: 7
+
+  promote:
+    name: 4. Promote and version model
+    needs: [train, evaluate]
+    # Only when the challenger won, and never from a pull request
+    if: needs.evaluate.outputs.promote == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.train.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download evaluated model
+        uses: actions/download-artifact@v4
+        with:
+          name: evaluated-model
+          path: Lab2/build/
+
+      - name: Store versioned model and update registry
+        run: python src/promote_model.py promote --version "$VERSION"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898583+github-actions[bot]@users.noreply.github.com"
+          git add models/ metrics/
+          git commit -m "Lab2: promote model $VERSION ($MODEL_TYPE) [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Add to run summary
+        run: echo "Model \`$VERSION\` is now the champion, committed to \`Lab2/models/\`." >> "$GITHUB_STEP_SUMMARY"
